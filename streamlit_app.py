@@ -178,26 +178,45 @@ def build_multi_city_research(plan, travel_style: str, budget_range: str, intere
     return "\n\n".join(chunks)
 
 
-def collect_hotel_hits(plan, budget_range: str):
+def collect_hotel_hits(plan, budget_range: str, nightly_min=None, nightly_max=None, currency="USD"):
     """Search real hotel listings per city for prompts and fallbacks."""
     out = []
+    ccy = currency or "USD"
+    lo = nightly_min
+    hi = nightly_max
     for p in plan:
-        hits = duckduckgo_search(
-            f"{p['city']} {budget_range} hotels downtown",
-            max_results=4,
-            enrich=False,
-        )
+        queries = [
+            f"{p['city']} hotels {budget_range} {lo}-{hi} {ccy} per night",
+            f"{p['city']} guesthouse hotel under {hi} {ccy}",
+        ]
+        if budget_range == "Budget-Friendly":
+            queries.extend([
+                f"{p['city']} budget hotel hostel homestay cheap stay",
+                f"{p['city']} 2 star 3 star hotel downtown affordable",
+            ])
+        elif budget_range == "Mid-Range":
+            queries.append(f"{p['city']} 3 star 4 star hotel {lo}-{hi} {ccy}")
+        else:
+            queries.append(f"{p['city']} luxury boutique hotel {lo}-{hi} {ccy}")
+
+        seen = set()
         cleaned = []
-        for h in hits or []:
-            title = (h.get("title") or "").strip()
-            if not title or title.lower() == "search error":
-                continue
-            cleaned.append({
-                "title": title,
-                "url": h.get("url") or "",
-                "snippet": (h.get("snippet") or "")[:180],
-            })
-        out.append({"city": p["city"], "hits": cleaned[:4]})
+        for query in queries:
+            hits = duckduckgo_search(query, max_results=5, enrich=False)
+            for h in hits or []:
+                title = (h.get("title") or "").strip()
+                key = title.lower()
+                if not title or title.lower() == "search error" or key in seen:
+                    continue
+                seen.add(key)
+                cleaned.append({
+                    "title": title,
+                    "url": h.get("url") or "",
+                    "snippet": (h.get("snippet") or "")[:180],
+                })
+            if len(cleaned) >= 8:
+                break
+        out.append({"city": p["city"], "hits": cleaned[:8]})
     return out
 
 
@@ -213,18 +232,27 @@ def format_hotel_research_notes(hotel_hits) -> str:
     return "\n\n".join(chunks)
 
 
-def fallback_hotels_markdown(hotel_hits, currency: str) -> str:
+def fallback_hotels_markdown(hotel_hits, currency: str, nightly_min=None, nightly_max=None) -> str:
     """Deterministic hotel list from search hits when the model leaks reasoning."""
     rec_lines = []
     alt_lines = []
     ccy = currency or "USD"
+    range_note = ""
+    if nightly_min is not None and nightly_max is not None:
+        range_note = f" Aim for about {ccy} {int(nightly_min)}–{int(nightly_max)} per night."
     for item in hotel_hits or []:
         city = item.get("city") or "City"
         hits = item.get("hits") or []
-        rec = hits[0] if hits else None
-        alt = hits[1] if len(hits) > 1 else rec
-        rec_lines.append(_format_hotel_bullet(city, rec, ccy, "central stay"))
-        alt_lines.append(_format_hotel_bullet(city, alt, ccy, "backup stay"))
+        recs = hits[:3]
+        alts = hits[3:6] or hits[:3]
+        if not recs:
+            rec_lines.append(_format_hotel_bullet(city, None, ccy, "central stay") + range_note)
+            alt_lines.append(_format_hotel_bullet(city, None, ccy, "backup stay") + range_note)
+            continue
+        for hit in recs:
+            rec_lines.append(_format_hotel_bullet(city, hit, ccy, "in-budget stay") + range_note)
+        for hit in alts:
+            alt_lines.append(_format_hotel_bullet(city, hit, ccy, "backup stay") + range_note)
     return (
         "Recommended\n"
         + "\n".join(rec_lines)
@@ -251,7 +279,7 @@ def build_hotel_research(plan, budget_range: str):
     return format_hotel_research_notes(collect_hotel_hits(plan, budget_range))
 
 
-def estimate_trip_budget(budget_range: str, num_days: int, city_count: int, travelers: int) -> dict:
+def estimate_trip_budget(budget_range: str, num_days: int, city_count: int, travelers: int, lodging_night_usd=None) -> dict:
     """Deterministic USD ranges so budgets can be converted to any currency."""
     rates = {
         "Budget-Friendly": {
@@ -267,15 +295,18 @@ def estimate_trip_budget(budget_range: str, num_days: int, city_count: int, trav
             "local": (25, 65), "intercity": (90, 260),
         },
     }
-    band = rates.get(budget_range, rates["Mid-Range"])
+    band = dict(rates.get(budget_range, rates["Mid-Range"]))
+    if lodging_night_usd and lodging_night_usd[0] > 0 and lodging_night_usd[1] > 0:
+        band["lodging"] = (min(lodging_night_usd), max(lodging_night_usd))
     nights = max(num_days - 1, 1)
     hops = max(city_count - 1, 0)
     people = max(travelers, 1)
+    rooms = max(1, (people + 1) // 2)
 
-    def span(lo, hi, qty):
-        return lo * qty * people, hi * qty * people
+    def span(lo, hi, qty, count=people):
+        return lo * qty * count, hi * qty * count
 
-    lodging = span(*band["lodging"], nights)
+    lodging = span(*band["lodging"], nights, rooms)
     food = span(*band["food"], num_days)
     activities = span(*band["activities"], num_days)
     local = span(*band["local"], num_days)
@@ -407,6 +438,46 @@ def usd_to_currency(amount_usd: float, currency: str, rates=None) -> float:
     rates = rates or fetch_usd_rates()
     rate = float(rates.get(currency, 1.0) or 1.0)
     return amount_usd * rate
+
+
+DEFAULT_NIGHTLY_USD = {
+    "Budget-Friendly": (30, 70),
+    "Mid-Range": (80, 170),
+    "Luxury": (200, 480),
+}
+
+
+def currency_to_usd(amount, currency, rates=None) -> float:
+    rates = rates or fetch_usd_rates()
+    rate = float(rates.get(currency, 1.0) or 1.0)
+    if rate <= 0:
+        return float(amount)
+    return float(amount) / rate
+
+
+def convert_amount(amount, from_ccy, to_ccy, rates=None) -> float:
+    if not from_ccy or from_ccy == to_ccy:
+        return float(amount)
+    rates = rates or fetch_usd_rates()
+    return usd_to_currency(currency_to_usd(amount, from_ccy, rates), to_ccy, rates)
+
+
+def _round_local_money(amount, currency) -> int:
+    value = max(1, float(amount))
+    if currency in {"JPY", "KRW", "VND", "IDR"}:
+        return max(1, int(round(value / 100.0) * 100))
+    if currency in {"INR", "THB", "PHP", "PKR", "NPR"}:
+        return max(1, int(round(value / 50.0) * 50))
+    return max(1, int(round(value)))
+
+
+def nightly_defaults_local(band, currency):
+    lo, hi = DEFAULT_NIGHTLY_USD.get(band, DEFAULT_NIGHTLY_USD["Mid-Range"])
+    rates = fetch_usd_rates()
+    return (
+        _round_local_money(usd_to_currency(lo, currency, rates), currency),
+        _round_local_money(usd_to_currency(hi, currency, rates), currency),
+    )
 
 
 def money(amount_usd: float, currency: str, rates=None) -> str:
@@ -1002,7 +1073,7 @@ st.markdown(
 
 title_col, currency_col = st.columns([5, 1.35])
 with title_col:
-    st.title("🌍 AI Travel Planner Plus")
+    st.title("🧭 Pocket Route")
     st.caption("Plan single-city or multi-city trips with hotels, budget estimates, weather, and booking links")
 with currency_col:
     current_ccy = st.session_state.get("display_currency", "USD")
@@ -1038,8 +1109,29 @@ use_budget = st.sidebar.checkbox("Enable Budget Estimate", value=True)
 st.sidebar.header("✈️ Travel Preferences")
 travel_style = st.sidebar.selectbox("Travel Style", 
     ["Adventure", "Relaxation", "Culture", "Family-Friendly", "Business", "Luxury"])
-budget_range = st.sidebar.selectbox("Budget Range", 
-    ["Budget-Friendly", "Mid-Range", "Luxury"])
+budget_range = st.sidebar.selectbox("Budget Range",
+    ["Budget-Friendly", "Mid-Range", "Luxury"],
+    help="A starting band. Set the nightly stay range below so hotels match what that means for you.")
+pref_ccy = st.session_state.get("display_currency") or "USD"
+default_lo, default_hi = nightly_defaults_local(budget_range, pref_ccy)
+range_sig = f"{budget_range}|{pref_ccy}"
+if st.session_state.get("nightly_range_sig") != range_sig:
+    st.session_state.nightly_range_sig = range_sig
+    st.session_state.nightly_min = default_lo
+    st.session_state.nightly_max = default_hi
+st.sidebar.markdown(f"**Your {budget_range.lower()} nightly stay** ({pref_ccy} / room)")
+step = 500 if pref_ccy in {"INR", "JPY", "KRW", "VND", "IDR", "PKR", "NPR"} else 10
+nightly_min = st.sidebar.number_input(
+    "From", min_value=1, step=step, key="nightly_min",
+    help="Lowest nightly room rate you want hotel suggestions to use.",
+)
+nightly_max = st.sidebar.number_input(
+    "To", min_value=1, step=step, key="nightly_max",
+    help="Highest nightly room rate you want hotel suggestions to use.",
+)
+if nightly_max < nightly_min:
+    nightly_max = nightly_min
+st.sidebar.caption("Hotels and the lodging line in the budget estimate stay inside this range.")
 start_date = st.sidebar.date_input("Travel Start Date", value=datetime.today())
 travelers = st.sidebar.number_input("Travelers", min_value=1, max_value=8, value=1)
 interests = st.sidebar.multiselect("Interests",
@@ -1155,14 +1247,16 @@ if openai_api_key:
         role="Suggests hotels that match budget, dates, and city stays",
         model=create_llm(openai_api_key),
         description=dedent("""\
-            You are a hotel specialist. Recommend a few well-known hotels or
-            neighborhoods to stay in for each city on the trip.
+            You are a hotel specialist. Recommend several in-budget hotels or
+            guesthouses for each city. Never suggest luxury palaces when the
+            traveler set a modest nightly range.
         """),
         instructions=[
-            "For each city, give exactly one Recommended stay and one Alternative stay.",
-            "Use the headings Recommended and Alternative on their own lines. Nothing else as a heading.",
-            "Each stay must include hotel name, neighborhood, nightly price in the requested currency, why it fits, and a booking site.",
-            "If search notes are thin, still name well-known properties in that city.",
+            "For each city, list 3 Recommended stays and 3 Alternative stays.",
+            "Use the headings Recommended and Alternative on their own lines.",
+            "Every stay MUST fit the traveler's nightly min–max in the requested currency. Skip 5-star, palace, and luxury properties when the max is a budget or mid-range amount.",
+            "Each stay: hotel name, neighborhood, nightly price in the requested currency, why it fits, booking site.",
+            "Prefer search-note properties that look affordable. If notes are thin, name well-known budget or mid-range stays, not landmark luxury hotels.",
             "Output the hotel list only. Never discuss instructions, conflicts, or your reasoning.",
         ],
         tools=[],
@@ -1206,7 +1300,16 @@ if openai_api_key:
         city_plan_text = format_city_plan(city_plan)
         trip_currency = infer_currency_from_places([stop["city"] for stop in city_plan])
         currency_symbol = CURRENCY_SYMBOLS.get(trip_currency, f"{trip_currency} ")
-        debug_log("travel_agent.py:292", "Button clicked", {"destination": destination, "num_days": num_days, "currency": trip_currency}, "A")
+        range_ccy = st.session_state.get("display_currency") or trip_currency
+        nightly_min_local = min(int(nightly_min), int(nightly_max))
+        nightly_max_local = max(int(nightly_min), int(nightly_max))
+        nightly_min_trip = _round_local_money(convert_amount(nightly_min_local, range_ccy, trip_currency), trip_currency)
+        nightly_max_trip = _round_local_money(convert_amount(nightly_max_local, range_ccy, trip_currency), trip_currency)
+        lodging_night_usd = (
+            currency_to_usd(nightly_min_local, range_ccy),
+            currency_to_usd(nightly_max_local, range_ccy),
+        )
+        debug_log("travel_agent.py:292", "Button clicked", {"destination": destination, "num_days": num_days, "currency": trip_currency, "nightly": [nightly_min_trip, nightly_max_trip]}, "A")
         if not city_plan:
             st.error("Please enter at least one city.")
         else:
@@ -1334,6 +1437,7 @@ if openai_api_key:
                 Duration: {num_days} days
                 Travel Style: {travel_style}
                 Budget Range: {budget_range}
+                Nightly hotel budget: {int(nightly_min_trip)}–{int(nightly_max_trip)} {trip_currency} per room
                 Currency for all prices: {trip_currency} ({currency_symbol.strip()})
                 Travelers: {travelers}
                 Interests: {', '.join(interests) if interests else 'General'}
@@ -1380,7 +1484,7 @@ if openai_api_key:
                 progress_bar.progress(72)
                 alt_prompt = f"""
                 Create a DIFFERENT itinerary for the same trip. Do not copy the first plan's main sights.
-                Same cities, days, budget ({budget_range}), and style ({travel_style}).
+                Same cities, days, budget ({budget_range}, hotels {int(nightly_min_trip)}–{int(nightly_max_trip)} {trip_currency}/night), and style ({travel_style}).
                 Keep all approximate costs in {trip_currency} ({currency_symbol.strip()}) only.
                 Use headings like "Day 1 (City):". Under 800 words.
 
@@ -1439,18 +1543,25 @@ if openai_api_key:
                 if use_hotels and hotel_agent:
                     status_text.text("🏨 Finding hotel options...")
                     progress_bar.progress(88)
-                    hotel_hits = collect_hotel_hits(city_plan, budget_range)
-                    hotel_notes = truncate_content(format_hotel_research_notes(hotel_hits), max_length=1000)
+                    hotel_hits = collect_hotel_hits(
+                        city_plan, budget_range, nightly_min_trip, nightly_max_trip, trip_currency
+                    )
+                    hotel_notes = truncate_content(format_hotel_research_notes(hotel_hits), max_length=1200)
                     hotels_prompt = f"""
                     Output ONLY this structure. Do not explain, debate instructions, or think out loud.
 
                     Recommended
-                    - City: Hotel name. Neighborhood. Nightly {trip_currency} range. Why it fits. Booking site.
+                    - City: Hotel name. Neighborhood. Nightly {trip_currency} price. Why it fits. Booking site.
+                    - City: Hotel name. Neighborhood. Nightly {trip_currency} price. Why it fits. Booking site.
+                    - City: Hotel name. Neighborhood. Nightly {trip_currency} price. Why it fits. Booking site.
 
                     Alternative
-                    - City: Hotel name. Neighborhood. Nightly {trip_currency} range. Why it fits. Booking site.
+                    - City: Hotel name. Neighborhood. Nightly {trip_currency} price. Why it fits. Booking site.
+                    - City: Hotel name. Neighborhood. Nightly {trip_currency} price. Why it fits. Booking site.
+                    - City: Hotel name. Neighborhood. Nightly {trip_currency} price. Why it fits. Booking site.
 
-                    Budget: {budget_range}
+                    Budget band: {budget_range}
+                    Nightly room budget: {nightly_min_trip}–{nightly_max_trip} {trip_currency} ONLY. Do not suggest hotels above {nightly_max_trip} {trip_currency}.
                     Travelers: {travelers}
                     Stay plan:
                     {city_plan_text}
@@ -1458,7 +1569,7 @@ if openai_api_key:
                     Hotel search notes:
                     {hotel_notes}
 
-                    One recommended stay and one alternative stay per city. Short bullets only.
+                    Three recommended stays and three alternative stays per city, all inside that nightly range. Short bullets only.
                     """
                     try:
                         hotels_info = run_agent_with_timeout(hotel_agent, hotels_prompt, timeout_seconds=120, agent_name="HotelAgent")
@@ -1467,7 +1578,9 @@ if openai_api_key:
                         hotels_info = None
 
                 budget_info = None
-                budget_data = estimate_trip_budget(budget_range, num_days, len(city_plan), travelers)
+                budget_data = estimate_trip_budget(
+                    budget_range, num_days, len(city_plan), travelers, lodging_night_usd
+                )
                 baseline_budget = format_budget_estimate(budget_data, trip_currency)
                 if use_budget:
                     status_text.text("💰 Estimating budget...")
@@ -1485,7 +1598,7 @@ if openai_api_key:
                         Hotel notes:
                         {truncate_content(extract_agent_text(hotels_info), 400) if hotels_info else "None"}
 
-                        Keep all amounts in {trip_currency} ({currency_symbol.strip()}). Mention that flights from home are not included.
+                        Keep all amounts in {trip_currency} ({currency_symbol.strip()}). Lodging should follow {nightly_min_trip}–{nightly_max_trip} {trip_currency} per room per night. Mention that flights from home are not included.
                         Under 180 words.
                         """
                         try:
@@ -1503,7 +1616,10 @@ if openai_api_key:
 
                 hotels_text = extract_agent_text(hotels_info)
                 if not has_hotel_substance(hotels_text):
-                    hotels_text = fallback_hotels_markdown(hotel_hits, trip_currency) if use_hotels else None
+                    hotels_text = (
+                        fallback_hotels_markdown(hotel_hits, trip_currency, nightly_min_trip, nightly_max_trip)
+                        if use_hotels else None
+                    )
                 hotels_recommended, hotels_alternative = split_recommended_alternative(hotels_text)
 
                 budget_text = extract_agent_text(budget_info)
@@ -1536,6 +1652,8 @@ if openai_api_key:
                 st.session_state.plan_choice = "Recommended"
                 st.session_state.hotel_choice = "Recommended"
                 st.session_state.weather_enabled = bool(use_weather)
+                st.session_state.hotel_nightly_min = nightly_min_trip
+                st.session_state.hotel_nightly_max = nightly_max_trip
                 st.rerun()
             except TimeoutError as e:
                 # #region agent log
@@ -1611,12 +1729,21 @@ if openai_api_key:
                     hotel_options,
                     horizontal=True,
                     key="hotel_choice",
+                    help="Each list has several stays. Pick Recommended first, then Alternative for more in-budget options.",
                 )
                 hotels_content = st.session_state.get("hotels_recommended") or st.session_state.hotels_info
                 if hotel_choice == "Alternative" and st.session_state.get("hotels_alternative"):
                     hotels_content = st.session_state.hotels_alternative
                 url_pattern = re.compile(r'(https?://[^\s]+)')
                 st.markdown(url_pattern.sub(r'[\1](\1)', text_in_display_currency(hotels_content or "")))
+                lo = st.session_state.get("hotel_nightly_min")
+                hi = st.session_state.get("hotel_nightly_max")
+                ccy = st.session_state.get("display_currency") or "USD"
+                src = st.session_state.get("price_currency") or ccy
+                if lo and hi:
+                    shown_lo = format_local_amount(convert_amount(lo, src, ccy), ccy)
+                    shown_hi = format_local_amount(convert_amount(hi, src, ccy), ccy)
+                    st.caption(f"Stays aimed at {shown_lo}–{shown_hi} per room / night. Change the sidebar range and generate again to retarget hotels.")
         
         # Display Activities with Booking Links
         if st.session_state.activities_info:
