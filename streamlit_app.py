@@ -178,22 +178,77 @@ def build_multi_city_research(plan, travel_style: str, budget_range: str, intere
     return "\n\n".join(chunks)
 
 
-def build_hotel_research(plan, budget_range: str):
-    chunks = []
+def collect_hotel_hits(plan, budget_range: str):
+    """Search real hotel listings per city for prompts and fallbacks."""
+    out = []
     for p in plan:
         hits = duckduckgo_search(
             f"{p['city']} {budget_range} hotels downtown",
             max_results=4,
             enrich=False,
         )
+        cleaned = []
+        for h in hits or []:
+            title = (h.get("title") or "").strip()
+            if not title or title.lower() == "search error":
+                continue
+            cleaned.append({
+                "title": title,
+                "url": h.get("url") or "",
+                "snippet": (h.get("snippet") or "")[:180],
+            })
+        out.append({"city": p["city"], "hits": cleaned[:4]})
+    return out
+
+
+def format_hotel_research_notes(hotel_hits) -> str:
+    chunks = []
+    for item in hotel_hits or []:
         lines = []
-        for h in hits[:4]:
-            title = h.get("title") or "Hotel result"
-            url = h.get("url") or ""
-            snippet = (h.get("snippet") or "")[:180]
-            lines.append(f"- {title} — {snippet} ({url})")
-        chunks.append(f"{p['city']}:\n" + ("\n".join(lines) if lines else "- No hotel listings found"))
+        for h in item.get("hits") or []:
+            url = f" ({h['url']})" if h.get("url") else ""
+            snippet = f" — {h['snippet']}" if h.get("snippet") else ""
+            lines.append(f"- {h['title']}{snippet}{url}")
+        chunks.append(f"{item['city']}:\n" + ("\n".join(lines) if lines else "- No hotel listings found"))
     return "\n\n".join(chunks)
+
+
+def fallback_hotels_markdown(hotel_hits, currency: str) -> str:
+    """Deterministic hotel list from search hits when the model leaks reasoning."""
+    rec_lines = []
+    alt_lines = []
+    ccy = currency or "USD"
+    for item in hotel_hits or []:
+        city = item.get("city") or "City"
+        hits = item.get("hits") or []
+        rec = hits[0] if hits else None
+        alt = hits[1] if len(hits) > 1 else rec
+        rec_lines.append(_format_hotel_bullet(city, rec, ccy, "central stay"))
+        alt_lines.append(_format_hotel_bullet(city, alt, ccy, "backup stay"))
+    return (
+        "Recommended\n"
+        + "\n".join(rec_lines)
+        + "\n\nAlternative\n"
+        + "\n".join(alt_lines)
+    )
+
+
+def _format_hotel_bullet(city, hit, currency, kind):
+    if not hit:
+        return (
+            f"- {city}: Search Booking.com for a well-reviewed {kind} near the center. "
+            f"Confirm the nightly rate in {currency} before booking. https://www.booking.com"
+        )
+    snippet = f" {hit['snippet']}" if hit.get("snippet") else ""
+    url = hit.get("url") or "https://www.booking.com"
+    return (
+        f"- {city}: {hit['title']}.{snippet} "
+        f"Typical nightly rate in {currency} (confirm on the booking site). {url}"
+    )
+
+
+def build_hotel_research(plan, budget_range: str):
+    return format_hotel_research_notes(collect_hotel_hits(plan, budget_range))
 
 
 def estimate_trip_budget(budget_range: str, num_days: int, city_count: int, travelers: int) -> dict:
@@ -573,19 +628,25 @@ def _run_agent_prompt(agent, prompt: str):
         description = str(getattr(agent, "description", "") or "")
         system_prompt = f"{description}\n{instruction_text}".strip() or "You are a concise travel assistant."
         client = GroqSDK(api_key=api_key)
-        completion = client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=[
+        create_kwargs = {
+            "model": "openai/gpt-oss-20b",
+            "messages": [
                 {"role": "system", "content": system_prompt[:1200]},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=1800,
-            temperature=0.6,
-        )
+            "max_tokens": 1800,
+            "temperature": 0.4,
+        }
+        try:
+            completion = client.chat.completions.create(
+                **create_kwargs,
+                reasoning_format="hidden",
+                reasoning_effort="low",
+            )
+        except Exception:
+            completion = client.chat.completions.create(**create_kwargs)
         message = completion.choices[0].message
         text = (message.content or "").strip()
-        if not text:
-            text = str(getattr(message, "reasoning", "") or "").strip()
         return SimpleNamespace(content=text)
     return agent.run(prompt, stream=False)
 
@@ -640,6 +701,42 @@ def split_recommended_alternative(text: str):
     return text.strip(), ""
 
 
+def looks_like_reasoning(text: str) -> bool:
+    """Catch gpt-oss chain-of-thought that leaked into the visible answer."""
+    if not text:
+        return True
+    lowered = text.lower()
+    markers = (
+        "we need to output",
+        "the instruction:",
+        "developer instruction",
+        "system > developer",
+        "which to follow",
+        "hierarchy:",
+        "let's pick",
+        "thinking process",
+        "the user explicitly",
+        "overrides user",
+        "there is a conflict",
+        "so we should provide",
+        "usually developer instructions",
+        "no extra commentary",
+        "use headings exactly",
+    )
+    hits = sum(1 for marker in markers if marker in lowered)
+    return hits >= 2
+
+
+def strip_reasoning(text: str) -> str:
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
+    if looks_like_reasoning(text):
+        match = re.search(r"(?im)^(?:#{0,3}\s*)?(recommended|day\s*1)\b", text)
+        if match and match.start() > 60:
+            text = text[match.start():]
+    return text.strip()
+
+
 def extract_agent_text(result) -> str:
     """Get clean text from an agent result and drop model error payloads."""
     if result is None:
@@ -647,14 +744,13 @@ def extract_agent_text(result) -> str:
     text = getattr(result, "content", None)
     if text is None:
         text = str(result)
-    text = str(text).strip()
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
-    return text.strip()
+    return strip_reasoning(str(text).strip())
 
 
 def is_failed_model_output(text: str) -> bool:
     if not text:
+        return True
+    if looks_like_reasoning(text):
         return True
     lowered = text.lower()
     failure_markers = (
@@ -664,6 +760,12 @@ def is_failed_model_output(text: str) -> bool:
         '"error":{"message"',
     )
     return any(marker in lowered for marker in failure_markers)
+
+
+def has_hotel_substance(text: str) -> bool:
+    if not text or is_failed_model_output(text):
+        return False
+    return bool(re.search(r"(?i)(hotel|inn|resort|hostel|palace|haveli|booking\.com|hotels\.com)", text))
 
 
 def create_llm(api_key: str):
@@ -1057,11 +1159,11 @@ if openai_api_key:
             neighborhoods to stay in for each city on the trip.
         """),
         instructions=[
-            "Suggest 2 hotels per city, matching the stated budget range.",
-            "Include neighborhood, why it fits the trip, and an approximate nightly price in the requested currency.",
-            "Name likely booking sites (Booking.com, Hotels.com, official hotel site).",
-            "If search notes are thin, still recommend well-known properties in that city.",
-            "Return short bullets only. No API error talk.",
+            "For each city, give exactly one Recommended stay and one Alternative stay.",
+            "Use the headings Recommended and Alternative on their own lines. Nothing else as a heading.",
+            "Each stay must include hotel name, neighborhood, nightly price in the requested currency, why it fits, and a booking site.",
+            "If search notes are thin, still name well-known properties in that city.",
+            "Output the hotel list only. Never discuss instructions, conflicts, or your reasoning.",
         ],
         tools=[],
     ) if use_hotels else None
@@ -1333,15 +1435,21 @@ if openai_api_key:
                     # #endregion
 
                 hotels_info = None
+                hotel_hits = []
                 if use_hotels and hotel_agent:
                     status_text.text("🏨 Finding hotel options...")
                     progress_bar.progress(88)
-                    hotel_notes = truncate_content(build_hotel_research(city_plan, budget_range), max_length=1000)
+                    hotel_hits = collect_hotel_hits(city_plan, budget_range)
+                    hotel_notes = truncate_content(format_hotel_research_notes(hotel_hits), max_length=1000)
                     hotels_prompt = f"""
-                    For each city, give one Recommended stay and one Alternative stay.
-                    Use these exact headings:
+                    Output ONLY this structure. Do not explain, debate instructions, or think out loud.
+
                     Recommended
+                    - City: Hotel name. Neighborhood. Nightly {trip_currency} range. Why it fits. Booking site.
+
                     Alternative
+                    - City: Hotel name. Neighborhood. Nightly {trip_currency} range. Why it fits. Booking site.
+
                     Budget: {budget_range}
                     Travelers: {travelers}
                     Stay plan:
@@ -1350,8 +1458,7 @@ if openai_api_key:
                     Hotel search notes:
                     {hotel_notes}
 
-                    Include neighborhood, nightly {trip_currency} range, and a booking site.
-                    Short bullets only.
+                    One recommended stay and one alternative stay per city. Short bullets only.
                     """
                     try:
                         hotels_info = run_agent_with_timeout(hotel_agent, hotels_prompt, timeout_seconds=120, agent_name="HotelAgent")
@@ -1395,8 +1502,8 @@ if openai_api_key:
                     activities_text = None
 
                 hotels_text = extract_agent_text(hotels_info)
-                if is_failed_model_output(hotels_text):
-                    hotels_text = None
+                if not has_hotel_substance(hotels_text):
+                    hotels_text = fallback_hotels_markdown(hotel_hits, trip_currency) if use_hotels else None
                 hotels_recommended, hotels_alternative = split_recommended_alternative(hotels_text)
 
                 budget_text = extract_agent_text(budget_info)
