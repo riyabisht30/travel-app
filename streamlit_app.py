@@ -178,10 +178,26 @@ def build_multi_city_research(plan, travel_style: str, budget_range: str, intere
     return "\n\n".join(chunks)
 
 
-def collect_hotel_hits(plan, budget_range: str, nightly_min=None, nightly_max=None, currency="USD"):
+def normalize_hotel_key(text: str) -> str:
+    """Collapse listing titles so the same property is not listed twice."""
+    t = (text or "").lower()
+    t = re.sub(r"https?://\S+", " ", t)
+    t = re.sub(r"^[\-\*\d\.\)\s]+", "", t)
+    t = re.sub(r"^[^:]{2,40}:\s*", "", t, count=1)
+    t = re.sub(
+        r"\b(booking\.com|tripadvisor|hotels\.com|makemytrip|goibibo|agoda|expedia|trivago|kayak)\b",
+        " ",
+        t,
+    )
+    t = re.sub(r"\b(reviews?|prices?|deals?|photos?|official site|from \d+)\b", " ", t)
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    return " ".join(t.split())[:80]
+
+
+def collect_hotel_hits(plan, budget_range: str, nightly_min=None, nightly_max=None, currency="INR"):
     """Search real hotel listings per city for prompts and fallbacks."""
     out = []
-    ccy = currency or "USD"
+    ccy = currency or "INR"
     lo = nightly_min
     hi = nightly_max
     for p in plan:
@@ -205,7 +221,7 @@ def collect_hotel_hits(plan, budget_range: str, nightly_min=None, nightly_max=No
             hits = duckduckgo_search(query, max_results=5, enrich=False)
             for h in hits or []:
                 title = (h.get("title") or "").strip()
-                key = title.lower()
+                key = normalize_hotel_key(title)
                 if not title or title.lower() == "search error" or key in seen:
                     continue
                 seen.add(key)
@@ -236,29 +252,32 @@ def fallback_hotels_markdown(hotel_hits, currency: str, nightly_min=None, nightl
     """Deterministic hotel list from search hits when the model leaks reasoning."""
     rec_lines = []
     alt_lines = []
-    ccy = currency or "USD"
+    ccy = currency or "INR"
     range_note = ""
     if nightly_min is not None and nightly_max is not None:
         range_note = f" Aim for about {ccy} {int(nightly_min)}–{int(nightly_max)} per night."
+    used = set()
     for item in hotel_hits or []:
         city = item.get("city") or "City"
-        hits = item.get("hits") or []
-        recs = hits[:3]
-        alts = hits[3:6] or hits[:3]
+        unique_hits = []
+        for hit in item.get("hits") or []:
+            key = normalize_hotel_key(hit.get("title") or "")
+            if not key or key in used:
+                continue
+            used.add(key)
+            unique_hits.append(hit)
+        recs = unique_hits[:3]
+        alts = unique_hits[3:6]
         if not recs:
             rec_lines.append(_format_hotel_bullet(city, None, ccy, "central stay") + range_note)
-            alt_lines.append(_format_hotel_bullet(city, None, ccy, "backup stay") + range_note)
             continue
         for hit in recs:
             rec_lines.append(_format_hotel_bullet(city, hit, ccy, "in-budget stay") + range_note)
         for hit in alts:
             alt_lines.append(_format_hotel_bullet(city, hit, ccy, "backup stay") + range_note)
-    return (
-        "Recommended\n"
-        + "\n".join(rec_lines)
-        + "\n\nAlternative\n"
-        + "\n".join(alt_lines)
-    )
+    recommended = "Recommended\n" + "\n".join(rec_lines)
+    alternative = ("Alternative\n" + "\n".join(alt_lines)) if alt_lines else ""
+    return f"{recommended}\n\n{alternative}".strip()
 
 
 def _format_hotel_bullet(city, hit, currency, kind):
@@ -344,7 +363,7 @@ CURRENCY_SYMBOLS = {
 }
 
 CURRENCY_OPTIONS = [
-    "USD", "EUR", "GBP", "INR", "JPY", "AUD", "CAD", "CHF", "AED", "SGD",
+    "INR", "USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "AED", "SGD",
     "THB", "MXN", "BRL", "KRW", "CNY", "ZAR", "NZD", "HKD", "IDR", "PHP",
     "TRY", "PLN", "SEK", "NOK", "DKK", "SAR", "QAR", "EGP", "VND", "NPR",
     "LKR", "MYR", "ILS", "CZK", "PKR", "BDT",
@@ -417,7 +436,7 @@ def infer_currency_from_places(places) -> str:
         country = geocode_country_code(place)
         if country and country in ISO_TO_CURRENCY:
             return ISO_TO_CURRENCY[country]
-    return "USD"
+    return "INR"
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -553,8 +572,8 @@ def convert_prose_currency(text, from_ccy, to_ccy):
 def text_in_display_currency(text):
     return convert_prose_currency(
         text or "",
-        st.session_state.get("price_currency") or st.session_state.get("detected_currency") or "USD",
-        st.session_state.get("display_currency") or "USD",
+        st.session_state.get("price_currency") or st.session_state.get("detected_currency") or "INR",
+        st.session_state.get("display_currency") or "INR",
     )
 
 
@@ -562,7 +581,7 @@ def format_budget_estimate(data: dict, currency: str) -> str:
     if not data:
         return ""
     rates = fetch_usd_rates()
-    ccy = currency or "USD"
+    ccy = currency or "INR"
     return dedent(f"""\
         Baseline estimate in {ccy} for {data['people']} traveler(s), {data['budget_range']}, {data['num_days']} days / {data['nights']} nights, {data['city_count']} city(ies).
         - Lodging: {money(data['lodging'][0], ccy, rates)}–{money(data['lodging'][1], ccy, rates)} ({money(data['lodging_night'][0], ccy, rates)}–{money(data['lodging_night'][1], ccy, rates)}/room-night × {data['nights']} nights)
@@ -770,6 +789,57 @@ def split_recommended_alternative(text: str):
         alternative = parts[1].strip()
         return recommended, alternative
     return text.strip(), ""
+
+
+def uniquify_hotel_blocks(recommended: str, alternative: str):
+    """Drop duplicate hotel names within and across Recommended / Alternative."""
+    seen = set()
+
+    def filter_block(block):
+        lines_out = []
+        for line in (block or "").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if re.match(r"(?i)^#{0,3}\s*(recommended|alternative)\b", stripped):
+                continue
+            key = normalize_hotel_key(stripped)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            if not stripped.startswith("-"):
+                stripped = f"- {stripped}"
+            lines_out.append(stripped)
+        return "\n".join(lines_out)
+
+    return filter_block(recommended), filter_block(alternative)
+
+
+def fill_alt_from_hits(hotel_hits, recommended_text, currency, nightly_min=None, nightly_max=None):
+    """Build Alternative stays from leftover unique search hits."""
+    used = {
+        normalize_hotel_key(line)
+        for line in (recommended_text or "").splitlines()
+        if line.strip()
+    }
+    alt_lines = []
+    ccy = currency or "INR"
+    range_note = ""
+    if nightly_min is not None and nightly_max is not None:
+        range_note = f" Aim for about {ccy} {int(nightly_min)}–{int(nightly_max)} per night."
+    for item in hotel_hits or []:
+        city = item.get("city") or "City"
+        added_for_city = 0
+        for hit in item.get("hits") or []:
+            key = normalize_hotel_key(hit.get("title") or "")
+            if not key or key in used:
+                continue
+            used.add(key)
+            alt_lines.append(_format_hotel_bullet(city, hit, ccy, "backup stay") + range_note)
+            added_for_city += 1
+            if added_for_city >= 3:
+                break
+    return "\n".join(alt_lines)
 
 
 def looks_like_reasoning(text: str) -> bool:
@@ -1045,18 +1115,25 @@ if 'hotels_alternative' not in st.session_state:
 if 'weather_enabled' not in st.session_state:
     st.session_state.weather_enabled = False
 if 'display_currency' not in st.session_state:
-    st.session_state.display_currency = "USD"
+    st.session_state.display_currency = "INR"
 if 'detected_currency' not in st.session_state:
-    st.session_state.detected_currency = "USD"
+    st.session_state.detected_currency = "INR"
 if 'currency_manual' not in st.session_state:
     st.session_state.currency_manual = False
 if 'budget_data' not in st.session_state:
     st.session_state.budget_data = None
 if 'price_currency' not in st.session_state:
-    st.session_state.price_currency = "USD"
+    st.session_state.price_currency = "INR"
 
-if not st.session_state.currency_manual and st.session_state.get("detected_currency"):
-    st.session_state.display_currency = st.session_state.detected_currency
+# Old sessions defaulted to USD. Keep INR unless the traveler picked a currency.
+if not st.session_state.currency_manual and st.session_state.get("display_currency") == "USD":
+    st.session_state.display_currency = "INR"
+
+if st.session_state.pop("_use_destination_ccy", False):
+    dest_ccy = st.session_state.get("detected_currency")
+    if dest_ccy:
+        st.session_state.display_currency = dest_ccy
+        st.session_state.currency_manual = True
 
 st.markdown(
     """
@@ -1076,7 +1153,7 @@ with title_col:
     st.title("🧭 Pocket Route")
     st.caption("Plan single-city or multi-city trips with hotels, budget estimates, weather, and booking links")
 with currency_col:
-    current_ccy = st.session_state.get("display_currency", "USD")
+    current_ccy = st.session_state.get("display_currency", "INR")
     currency_choices = list(CURRENCY_OPTIONS)
     detected_ccy = st.session_state.get("detected_currency")
     if detected_ccy and detected_ccy not in currency_choices:
@@ -1087,13 +1164,13 @@ with currency_col:
             currency_choices,
             key="display_currency",
             on_change=mark_currency_manual,
-            help="Defaults to the local currency of the place you search. Change it anytime.",
+            help="Defaults to INR. Change it anytime.",
         )
         detected = st.session_state.get("detected_currency")
         if detected:
-            st.caption(f"Destination default: {detected}")
+            st.caption(f"Destination currency: {detected}")
             if st.button("Use destination currency", use_container_width=True):
-                st.session_state.currency_manual = False
+                st.session_state._use_destination_ccy = True
                 st.rerun()
 
 openai_api_key = get_server_api_key()
@@ -1112,7 +1189,7 @@ travel_style = st.sidebar.selectbox("Travel Style",
 budget_range = st.sidebar.selectbox("Budget Range",
     ["Budget-Friendly", "Mid-Range", "Luxury"],
     help="A starting band. Set the nightly stay range below so hotels match what that means for you.")
-pref_ccy = st.session_state.get("display_currency") or "USD"
+pref_ccy = st.session_state.get("display_currency") or "INR"
 default_lo, default_hi = nightly_defaults_local(budget_range, pref_ccy)
 range_sig = f"{budget_range}|{pref_ccy}"
 if st.session_state.get("nightly_range_sig") != range_sig:
@@ -1254,6 +1331,7 @@ if openai_api_key:
         instructions=[
             "For each city, list 3 Recommended stays and 3 Alternative stays.",
             "Use the headings Recommended and Alternative on their own lines.",
+            "Never repeat a hotel. Alternative must be different properties from Recommended, and each name may appear only once.",
             "Every stay MUST fit the traveler's nightly min–max in the requested currency. Skip 5-star, palace, and luxury properties when the max is a budget or mid-range amount.",
             "Each stay: hotel name, neighborhood, nightly price in the requested currency, why it fits, booking site.",
             "Prefer search-note properties that look affordable. If notes are thin, name well-known budget or mid-range stays, not landmark luxury hotels.",
@@ -1298,13 +1376,14 @@ if openai_api_key:
         city_plan = allocate_city_days(cities, num_days)
         destination = destination_label(city_plan)
         city_plan_text = format_city_plan(city_plan)
-        trip_currency = infer_currency_from_places([stop["city"] for stop in city_plan])
+        inferred_currency = infer_currency_from_places([stop["city"] for stop in city_plan])
+        trip_currency = st.session_state.get("display_currency") or "INR"
         currency_symbol = CURRENCY_SYMBOLS.get(trip_currency, f"{trip_currency} ")
-        range_ccy = st.session_state.get("display_currency") or trip_currency
+        range_ccy = trip_currency
         nightly_min_local = min(int(nightly_min), int(nightly_max))
         nightly_max_local = max(int(nightly_min), int(nightly_max))
-        nightly_min_trip = _round_local_money(convert_amount(nightly_min_local, range_ccy, trip_currency), trip_currency)
-        nightly_max_trip = _round_local_money(convert_amount(nightly_max_local, range_ccy, trip_currency), trip_currency)
+        nightly_min_trip = nightly_min_local
+        nightly_max_trip = nightly_max_local
         lodging_night_usd = (
             currency_to_usd(nightly_min_local, range_ccy),
             currency_to_usd(nightly_max_local, range_ccy),
@@ -1569,7 +1648,9 @@ if openai_api_key:
                     Hotel search notes:
                     {hotel_notes}
 
-                    Three recommended stays and three alternative stays per city, all inside that nightly range. Short bullets only.
+                    Three recommended stays and three alternative stays per city, all inside that nightly range.
+                    Never repeat a hotel name. Alternative must be different properties from Recommended.
+                    Short bullets only.
                     """
                     try:
                         hotels_info = run_agent_with_timeout(hotel_agent, hotels_prompt, timeout_seconds=120, agent_name="HotelAgent")
@@ -1621,6 +1702,17 @@ if openai_api_key:
                         if use_hotels else None
                     )
                 hotels_recommended, hotels_alternative = split_recommended_alternative(hotels_text)
+                hotels_recommended, hotels_alternative = uniquify_hotel_blocks(
+                    hotels_recommended, hotels_alternative
+                )
+                if use_hotels and not (hotels_alternative or "").strip():
+                    hotels_alternative = fill_alt_from_hits(
+                        hotel_hits, hotels_recommended, trip_currency, nightly_min_trip, nightly_max_trip
+                    )
+                if hotels_recommended:
+                    hotels_text = "Recommended\n" + hotels_recommended
+                    if hotels_alternative:
+                        hotels_text += "\n\nAlternative\n" + hotels_alternative
 
                 budget_text = extract_agent_text(budget_info)
                 if is_failed_model_output(budget_text):
@@ -1643,9 +1735,8 @@ if openai_api_key:
                 st.session_state.hotels_alternative = hotels_alternative
                 st.session_state.budget_info = budget_text if use_budget else None
                 st.session_state.budget_data = budget_data if use_budget else None
-                st.session_state.detected_currency = trip_currency
+                st.session_state.detected_currency = inferred_currency
                 st.session_state.price_currency = trip_currency
-                st.session_state.currency_manual = False
                 st.session_state.city_plan_text = city_plan_text
                 st.session_state.start_date = start_date
                 st.session_state.destination = destination
@@ -1705,14 +1796,14 @@ if openai_api_key:
         if plan_choice == "Alternative" and st.session_state.get("itinerary_alternative"):
             active_itinerary = st.session_state.itinerary_alternative
         st.session_state.itinerary = active_itinerary
-        display_ccy = st.session_state.get("display_currency") or "USD"
-        source_ccy = st.session_state.get("price_currency") or st.session_state.get("detected_currency") or "USD"
-        st.caption(f"Prices default to {source_ccy} for this destination. Showing {display_ccy}. Change currency with 💱 in the top-right.")
+        display_ccy = st.session_state.get("display_currency") or "INR"
+        source_ccy = st.session_state.get("price_currency") or st.session_state.get("detected_currency") or "INR"
+        st.caption(f"Plan amounts are in {source_ccy}. Showing {display_ccy}. Change currency with 💱 in the top-right.")
         st.write(text_in_display_currency(active_itinerary))
 
         if st.session_state.budget_data or st.session_state.budget_info:
             with st.expander("💰 Budget Estimate", expanded=True):
-                ccy = st.session_state.get("display_currency") or "USD"
+                ccy = st.session_state.get("display_currency") or "INR"
                 if st.session_state.budget_data:
                     st.markdown(format_budget_estimate(st.session_state.budget_data, ccy))
                 else:
@@ -1729,7 +1820,7 @@ if openai_api_key:
                     hotel_options,
                     horizontal=True,
                     key="hotel_choice",
-                    help="Each list has several stays. Pick Recommended first, then Alternative for more in-budget options.",
+                    help="Recommended and Alternative are different unique hotels. Switch lists if you want other in-budget stays.",
                 )
                 hotels_content = st.session_state.get("hotels_recommended") or st.session_state.hotels_info
                 if hotel_choice == "Alternative" and st.session_state.get("hotels_alternative"):
@@ -1738,7 +1829,7 @@ if openai_api_key:
                 st.markdown(url_pattern.sub(r'[\1](\1)', text_in_display_currency(hotels_content or "")))
                 lo = st.session_state.get("hotel_nightly_min")
                 hi = st.session_state.get("hotel_nightly_max")
-                ccy = st.session_state.get("display_currency") or "USD"
+                ccy = st.session_state.get("display_currency") or "INR"
                 src = st.session_state.get("price_currency") or ccy
                 if lo and hi:
                     shown_lo = format_local_amount(convert_amount(lo, src, ccy), ccy)
@@ -1809,7 +1900,7 @@ CITY PLAN
 {'='*60}
 BUDGET ESTIMATE
 {'='*60}
-{format_budget_estimate(st.session_state.budget_data, st.session_state.get('display_currency') or 'USD') if st.session_state.get('budget_data') else text_in_display_currency(st.session_state.budget_info if st.session_state.budget_info else 'Not available')}
+{format_budget_estimate(st.session_state.budget_data, st.session_state.get('display_currency') or 'INR') if st.session_state.get('budget_data') else text_in_display_currency(st.session_state.budget_info if st.session_state.budget_info else 'Not available')}
 
 {'='*60}
 HOTEL SUGGESTIONS
